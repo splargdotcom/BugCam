@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BugCam</title>
+<style>
+body{font:16px system-ui,sans-serif;background:#f4f7f2;color:#193c28;max-width:1100px;margin:24px auto;padding:0 18px}
+h1{margin:0;font-size:32px}p{line-height:1.6}a{color:#21643d}img{display:block;width:100%;max-height:75vh;object-fit:contain;background:#15241a;border-radius:10px}
+#summary{font-variant-numeric:tabular-nums}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}button{padding:10px;border-radius:8px;border:1px solid #62816c;background:white;color:inherit;cursor:pointer}
+</style>
+<h1>🐛 BugCam</h1><p id="summary">Connecting…</p>
+<img id="live" alt="Live rear-camera feed">
+<p><a href="/snapshot.jpg" target="_blank" rel="noopener">Full-frame snapshot</a> · <a href="/health">Health JSON</a> · <button id="reconnect">Reconnect video</button></p>
+<p><button data-control="/focus/lock">Lock focus here</button> <button data-control="/focus/auto">Continuous autofocus</button> <button data-control="/torch/on">Torch on</button> <button data-control="/torch/off">Torch off</button> <span id="controlmsg"></span></p>
+<details><summary>Diagnostics</summary><pre id="health"></pre></details>
+<script>
+const live=document.querySelector('#live'),summary=document.querySelector('#summary');
+let retryTimer, lastSequence=-1, unchangedSince=Date.now(), restarting=false;
+function connect(){clearTimeout(retryTimer);live.src='/stream?t='+Date.now();unchangedSince=Date.now();}
+live.onerror=()=>{clearTimeout(retryTimer);retryTimer=setTimeout(connect,3000)};
+document.querySelector('#reconnect').onclick=connect;
+document.querySelectorAll('[data-control]').forEach(b=>b.onclick=async()=>{
+ const m=document.querySelector('#controlmsg'); m.textContent='Working…';
+ try{const r=await fetch(b.dataset.control,{cache:'no-store'}); const j=await r.json(); m.textContent=j.message||j.error||('HTTP '+r.status)}
+ catch(e){m.textContent='Control failed: '+e}
+});
+async function poll(){
+ try{
+  const r=await fetch('/health',{cache:'no-store',signal:AbortSignal.timeout(4000)});
+  if(!r.ok)throw Error('HTTP '+r.status);
+  const h=await r.json();
+  summary.textContent=`${h.camera_state.replaceAll('_',' ')} · ${h.resolution.width} × ${h.resolution.height} · ${h.fps.toFixed(1)} fps · battery ${h.battery_percent ?? '?'}% / ${h.battery_temperature_c ?? '?'} °C · thermal ${h.thermal_status_name}`;
+  document.querySelector('#health').textContent=JSON.stringify(h,null,2);
+  if(h.camera_active && restarting){restarting=false;connect();}
+  if(!h.camera_active)restarting=true;
+  if(h.frame_count!==lastSequence){lastSequence=h.frame_count;unchangedSince=Date.now()}
+  else if(Date.now()-unchangedSince>15000){connect()}
+ }catch(e){summary.textContent='Connection lost — retrying. If the Wi-Fi address changed, reopen the new URL shown on the phone.';restarting=true;}
+ setTimeout(poll,2000);
+}
+connect();poll();
+// Some browsers leave the last multipart image displayed when a TCP stream closes.
+// Periodic renewal also recovers that case without creating overlapping viewers.
+setInterval(()=>{live.removeAttribute('src');connect()},120000);
+</script></html>

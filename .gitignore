@@ -1,0 +1,27 @@
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+**/build/
+
+# Android Studio / local machine
+.idea/
+*.iml
+local.properties
+
+# Signing material
+*.jks
+*.keystore
+keystore.properties
+
+# Generated packages / reports
+dist/
+verification/
+
+# Temporary / backup files
+*.before-*
+*.bak
+*~
+*.swp
+
+# OS noise
+.DS_Store
