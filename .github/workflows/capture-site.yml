@@ -1,0 +1,72 @@
+name: Capture live site screenshot
+
+on:
+  push:
+    paths:
+      - ".github/workflows/capture-site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    env:
+      SITE_URL: "https://bug.splarg.com/"
+      SITE_TITLE: "BugCam"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture live site
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p docs/screenshots
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)"
+          "$CHROME"             --headless=new             --no-sandbox             --disable-gpu             --hide-scrollbars             --window-size=1440,1000             --virtual-time-budget=6000             --screenshot=docs/screenshots/site.png             "$SITE_URL"
+          test -s docs/screenshots/site.png
+          file docs/screenshots/site.png
+
+      - name: Add screenshot to README
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          readme = Path("README.md")
+          text = readme.read_text(encoding="utf-8")
+          site = os.environ["SITE_URL"]
+          title = os.environ["SITE_TITLE"]
+          block = f'''<!-- site-screenshot:start -->
+<p align="center">
+  <a href="{site}"><img src="docs/screenshots/site.png" alt="{title} live site screenshot" width="900"></a>
+</p>
+<p align="center"><em>Live site: <a href="{site}">{site}</a></em></p>
+<!-- site-screenshot:end -->'''
+
+          text = re.sub(r'\n?<!-- site-screenshot:start -->.*?<!-- site-screenshot:end -->\n?', '\n', text, flags=re.S)
+
+          # Put the visual near the top, after the first introductory/open-site block.
+          lines = text.splitlines()
+          insert = 1
+          for i, line in enumerate(lines[1:12], start=1):
+              if line.startswith("## "):
+                  insert = i
+                  break
+              insert = i + 1
+          lines[insert:insert] = ["", block, ""]
+          readme.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+          PY
+
+      - name: Commit screenshot
+        shell: bash
+        run: |
+          rm -f .github/workflows/capture-site.yml
+          rmdir --ignore-fail-on-non-empty .github/workflows .github 2>/dev/null || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add live site screenshot [skip ci]"
+          git push
