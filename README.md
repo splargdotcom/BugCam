@@ -6,6 +6,14 @@ It was built for fixed installations where a phone remains powered, streams over
 
 BugCam was originally developed for a terrarium camera using a Google Pixel 7 Pro.
 
+**[Open the live BugCam site](https://bug.splarg.com/)**
+
+<!-- site-screenshot:start -->
+<p align="center">
+  <a href="https://bug.splarg.com/"><img src="docs/screenshots/site.png" alt="BugCam live site screenshot" width="900"></a>
+</p>
+<!-- site-screenshot:end -->
+
 ## Features
 
 - Rear-camera capture
