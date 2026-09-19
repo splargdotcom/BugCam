@@ -11,9 +11,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
       - name: Check out repository
@@ -26,18 +23,8 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Install required Android SDK packages
-        shell: bash
-        run: |
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-          "$SDKMANAGER" "platform-tools" "platforms;android-37" "build-tools;36.0.0"
+      - name: Make build scripts executable
+        run: chmod +x gradlew scripts/build-ubuntu.sh
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x gradlew
-
-      - name: Run unit tests and lint
-        run: ./gradlew test lint
-
-      - name: Build debug APK
-        run: ./gradlew assembleDebug
+      - name: Build, test and lint BugCam
+        run: ./scripts/build-ubuntu.sh
