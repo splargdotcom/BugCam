@@ -85,7 +85,7 @@ class BugCamService : Service() {
             if (Build.VERSION.SDK_INT >= 33) registerReceiver(batteryReceiver, filter, RECEIVER_NOT_EXPORTED)
             else @Suppress("DEPRECATION") registerReceiver(batteryReceiver, filter)
             receiverRegistered = true
-            camera = CameraController(this, config, frames).also { it.start() }
+            camera = CameraController(this, config, frames)
             http = WifiHttpHost(this, config, frames, ::healthJson,
                 assets.open("status.html").use { it.readBytes() }, ::handleControl).also { it.start() }
             handler.post(tick)
@@ -137,7 +137,7 @@ class BugCamService : Service() {
         val thermal = thermalStatus()
         val active = c.state == "streaming" && f.ageMillis != null && f.ageMillis <= 5000
         return JSONObject().apply {
-            put("app", "BugCam"); put("version", "1.0.0"); put("api_level", Build.VERSION.SDK_INT)
+            put("app", "BugCam"); put("version", "1.4.7-tuning-preview"); put("api_level", Build.VERSION.SDK_INT)
             put("service_uptime_seconds", (SystemClock.elapsedRealtime() - startedAt) / 1000.0)
             put("status", if (active) "ok" else "degraded")
             put("camera_active", active); put("camera_state", c.state); put("camera_id", c.cameraId ?: JSONObject.NULL)
@@ -180,6 +180,22 @@ class BugCamService : Service() {
         val path = target.substringBefore('?')
         val query = target.substringAfter('?', "")
 
+        if (path == "/camera/on") {
+            cam.start()
+            return HttpControlResult(
+                200,
+                "{\"ok\":true,\"message\":\"Camera starting\"}"
+            )
+        }
+
+        if (path == "/camera/off") {
+            cam.pause()
+            return HttpControlResult(
+                200,
+                "{\"ok\":true,\"message\":\"Camera idle\"}"
+            )
+        }
+
         var torchLevel: Int? = null
 
         if (path == "/torch/on" && query.isNotEmpty()) {
@@ -197,6 +213,41 @@ class BugCamService : Service() {
             }
         }
 
+        var focusDiopters: Float? = null
+        var exposureSteps: Int? = null
+
+        if (path == "/focus/set") {
+            val raw = query
+                .split('&')
+                .firstOrNull { it.startsWith("diopters=") }
+                ?.substringAfter('=')
+
+            focusDiopters = raw?.toFloatOrNull()
+
+            if (focusDiopters == null || !focusDiopters.isFinite()) {
+                return HttpControlResult(
+                    400,
+                    "{\"ok\":false,\"error\":\"Invalid focus distance\"}"
+                )
+            }
+        }
+
+        if (path == "/exposure/set") {
+            val raw = query
+                .split('&')
+                .firstOrNull { it.startsWith("steps=") }
+                ?.substringAfter('=')
+
+            exposureSteps = raw?.toIntOrNull()
+
+            if (exposureSteps == null) {
+                return HttpControlResult(
+                    400,
+                    "{\"ok\":false,\"error\":\"Invalid exposure value\"}"
+                )
+            }
+        }
+
         val latch = CountDownLatch(1)
         val ref = AtomicReference(CameraController.ControlResult(false, "No response"))
         val callback: (CameraController.ControlResult) -> Unit = {
@@ -208,6 +259,17 @@ class BugCamService : Service() {
             "/torch/off" -> cam.setTorchEnabled(false, null, callback)
             "/focus/lock" -> cam.lockCurrentFocus(callback)
             "/focus/auto" -> cam.setContinuousFocus(callback)
+            "/focus/restore" -> cam.setManualFocus(7.7071376f, callback)
+            "/focus/set" -> cam.setManualFocus(focusDiopters!!, callback)
+            "/focus/get" -> cam.getSavedFocus(callback)
+
+            "/exposure/set" -> cam.setExposureCompensation(exposureSteps!!, callback)
+            "/exposure/get" -> cam.getSavedExposure(callback)
+
+            "/exposure/0" -> cam.setExposureCompensation(0, callback)
+            "/exposure/p2" -> cam.setExposureCompensation(2, callback)
+            "/exposure/p3" -> cam.setExposureCompensation(3, callback)
+            "/exposure/p4" -> cam.setExposureCompensation(4, callback)
             else -> return HttpControlResult(404, "{\"ok\":false,\"error\":\"Unknown control\"}")
         }
         if (!latch.await(2500, TimeUnit.MILLISECONDS))

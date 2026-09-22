@@ -9,8 +9,8 @@ android {
         applicationId = "com.splarg.bugcam"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 13
+        versionName = "1.4.7-tuning-preview"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

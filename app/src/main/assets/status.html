@@ -1,43 +1,437 @@
 <!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BugCam</title>
+
 <style>
-body{font:16px system-ui,sans-serif;background:#f4f7f2;color:#193c28;max-width:1100px;margin:24px auto;padding:0 18px}
-h1{margin:0;font-size:32px}p{line-height:1.6}a{color:#21643d}img{display:block;width:100%;max-height:75vh;object-fit:contain;background:#15241a;border-radius:10px}
-#summary{font-variant-numeric:tabular-nums}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}button{padding:10px;border-radius:8px;border:1px solid #62816c;background:white;color:inherit;cursor:pointer}
-</style>
-<h1>🐛 BugCam</h1><p id="summary">Connecting…</p>
-<img id="live" alt="Live rear-camera feed">
-<p><a href="/snapshot.jpg" target="_blank" rel="noopener">Full-frame snapshot</a> · <a href="/health">Health JSON</a> · <button id="reconnect">Reconnect video</button></p>
-<p><button data-control="/focus/lock">Lock focus here</button> <button data-control="/focus/auto">Continuous autofocus</button> <button data-control="/torch/on">Torch on</button> <button data-control="/torch/off">Torch off</button> <span id="controlmsg"></span></p>
-<details><summary>Diagnostics</summary><pre id="health"></pre></details>
-<script>
-const live=document.querySelector('#live'),summary=document.querySelector('#summary');
-let retryTimer, lastSequence=-1, unchangedSince=Date.now(), restarting=false;
-function connect(){clearTimeout(retryTimer);live.src='/stream?t='+Date.now();unchangedSince=Date.now();}
-live.onerror=()=>{clearTimeout(retryTimer);retryTimer=setTimeout(connect,3000)};
-document.querySelector('#reconnect').onclick=connect;
-document.querySelectorAll('[data-control]').forEach(b=>b.onclick=async()=>{
- const m=document.querySelector('#controlmsg'); m.textContent='Working…';
- try{const r=await fetch(b.dataset.control,{cache:'no-store'}); const j=await r.json(); m.textContent=j.message||j.error||('HTTP '+r.status)}
- catch(e){m.textContent='Control failed: '+e}
-});
-async function poll(){
- try{
-  const r=await fetch('/health',{cache:'no-store',signal:AbortSignal.timeout(4000)});
-  if(!r.ok)throw Error('HTTP '+r.status);
-  const h=await r.json();
-  summary.textContent=`${h.camera_state.replaceAll('_',' ')} · ${h.resolution.width} × ${h.resolution.height} · ${h.fps.toFixed(1)} fps · battery ${h.battery_percent ?? '?'}% / ${h.battery_temperature_c ?? '?'} °C · thermal ${h.thermal_status_name}`;
-  document.querySelector('#health').textContent=JSON.stringify(h,null,2);
-  if(h.camera_active && restarting){restarting=false;connect();}
-  if(!h.camera_active)restarting=true;
-  if(h.frame_count!==lastSequence){lastSequence=h.frame_count;unchangedSince=Date.now()}
-  else if(Date.now()-unchangedSince>15000){connect()}
- }catch(e){summary.textContent='Connection lost — retrying. If the Wi-Fi address changed, reopen the new URL shown on the phone.';restarting=true;}
- setTimeout(poll,2000);
+*{box-sizing:border-box}
+body{
+    font:16px system-ui,sans-serif;
+    background:#f4f7f2;
+    color:#193c28;
+    max-width:1100px;
+    margin:24px auto;
+    padding:0 18px 40px
 }
-connect();poll();
-// Some browsers leave the last multipart image displayed when a TCP stream closes.
-// Periodic renewal also recovers that case without creating overlapping viewers.
-setInterval(()=>{live.removeAttribute('src');connect()},120000);
-</script></html>
+h1{margin:0;font-size:32px}
+h2{margin:28px 0 12px}
+p{line-height:1.55}
+a{color:#21643d}
+#summary{font-variant-numeric:tabular-nums}
+.panel{
+    background:white;
+    border:1px solid #cbd9cf;
+    border-radius:12px;
+    padding:18px;
+    margin:14px 0
+}
+.control{
+    display:grid;
+    grid-template-columns:140px minmax(160px,1fr) 150px;
+    gap:14px;
+    align-items:center;
+    margin:18px 0
+}
+.control label{font-weight:700}
+input[type=range]{width:100%}
+.value{
+    font-variant-numeric:tabular-nums;
+    text-align:right
+}
+.actions{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin-top:18px
+}
+button,.button{
+    display:inline-block;
+    padding:11px 14px;
+    border-radius:8px;
+    border:1px solid #62816c;
+    background:white;
+    color:inherit;
+    cursor:pointer;
+    font:inherit;
+    text-decoration:none
+}
+button.primary{
+    background:#21643d;
+    color:white;
+    border-color:#21643d
+}
+button:disabled{opacity:.5;cursor:wait}
+#preview{
+    display:none;
+    width:100%;
+    max-height:75vh;
+    object-fit:contain;
+    background:#15241a;
+    border-radius:10px
+}
+#empty{
+    min-height:260px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    text-align:center;
+    background:#e8eee9;
+    border-radius:10px;
+    color:#587060
+}
+#message{
+    min-height:1.5em;
+    margin-top:12px;
+    font-weight:600
+}
+.small{font-size:.9rem;color:#587060}
+pre{
+    white-space:pre-wrap;
+    overflow-wrap:anywhere;
+    font-size:13px
+}
+@media(max-width:650px){
+    .control{
+        grid-template-columns:1fr;
+        gap:5px
+    }
+    .value{text-align:left}
+}
+</style>
+
+<h1>🐛 BugCam</h1>
+<p id="summary">Connecting…</p>
+
+<div class="panel">
+    <h2>Camera tuning</h2>
+
+    <div class="control">
+        <label for="focus">Manual focus</label>
+        <input id="focus"
+               type="range"
+               min="0"
+               max="9.52"
+               step="0.01"
+               value="7.71">
+        <div class="value" id="focusValue"></div>
+    </div>
+
+    <div class="control">
+        <label for="exposure">Exposure</label>
+        <input id="exposure"
+               type="range"
+               min="-12"
+               max="12"
+               step="1"
+               value="0">
+        <div class="value" id="exposureValue"></div>
+    </div>
+
+    <p class="small">
+        Focus is saved in diopters. Exposure uses the Pixel's native
+        1/6-EV steps. Saved settings are automatically used by scheduled captures.
+    </p>
+
+    <div class="actions">
+        <button id="knownFocus">Known focus · 7.707 D</button>
+        <button id="zeroEv">Reset EV · 0</button>
+        <button id="save">Save settings</button>
+        <button id="test" class="primary">📷 Take test shot</button>
+    </div>
+
+    <div id="message"></div>
+</div>
+
+<h2>Test shot</h2>
+
+<div class="panel">
+    <div id="empty">
+        No test shot yet.<br>
+        Choose focus and exposure, then press “Take test shot”.
+    </div>
+
+    <img id="preview"
+         alt="BugCam test photograph">
+
+    <div class="actions">
+        <a id="download"
+           class="button"
+           hidden
+           download="bugcam-test.jpg">
+           Full-size JPEG
+        </a>
+
+        <a href="/health"
+           class="button"
+           target="_blank"
+           rel="noopener">
+           Health JSON
+        </a>
+    </div>
+</div>
+
+<details>
+    <summary>Diagnostics</summary>
+    <pre id="health"></pre>
+</details>
+
+<script>
+const $ = s => document.querySelector(s);
+
+const focus = $('#focus');
+const exposure = $('#exposure');
+const focusValue = $('#focusValue');
+const exposureValue = $('#exposureValue');
+const message = $('#message');
+const preview = $('#preview');
+const empty = $('#empty');
+const download = $('#download');
+
+let previewUrl = null;
+let busy = false;
+
+function sleep(ms){
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function focusText(){
+    const d = Number(focus.value);
+
+    if (d <= 0.001) {
+        return `${d.toFixed(2)} D · ∞`;
+    }
+
+    return `${d.toFixed(2)} D · ~${(100 / d).toFixed(1)} cm`;
+}
+
+function evText(){
+    const steps = Number(exposure.value);
+    const ev = steps / 6;
+    const sign = ev > 0 ? '+' : '';
+
+    return `${sign}${ev.toFixed(2)} EV · ${steps} steps`;
+}
+
+function updateLabels(){
+    focusValue.textContent = focusText();
+    exposureValue.textContent = evText();
+}
+
+focus.addEventListener('input', updateLabels);
+exposure.addEventListener('input', updateLabels);
+
+$('#knownFocus').addEventListener('click', () => {
+    focus.value = '7.7071376';
+    updateLabels();
+});
+
+$('#zeroEv').addEventListener('click', () => {
+    exposure.value = '0';
+    updateLabels();
+});
+
+function setBusy(on){
+    busy = on;
+    document.querySelectorAll('button').forEach(b => b.disabled = on);
+}
+
+async function control(url){
+    const r = await fetch(url, {cache:'no-store'});
+    let j = {};
+
+    try {
+        j = await r.json();
+    } catch (_) {}
+
+    if (!r.ok || j.ok === false) {
+        throw new Error(j.error || j.message || `HTTP ${r.status}`);
+    }
+
+    return j;
+}
+
+async function applySettings(){
+    const d = Number(focus.value);
+    const steps = Number(exposure.value);
+
+    await control(
+        '/focus/set?diopters=' +
+        encodeURIComponent(d.toFixed(6))
+    );
+
+    await control(
+        '/exposure/set?steps=' +
+        encodeURIComponent(String(steps))
+    );
+}
+
+async function withCamera(task){
+    await control('/camera/on');
+
+    try {
+        // Allow AE/AWB and the camera pipeline to settle.
+        await sleep(2000);
+        return await task();
+    } finally {
+        try {
+            await control('/camera/off');
+        } catch (_) {}
+    }
+}
+
+async function getFreshSnapshot(){
+    let lastError = null;
+
+    for (let i = 0; i < 8; i++) {
+        try {
+            const r = await fetch(
+                '/snapshot.jpg?t=' + Date.now(),
+                {cache:'no-store'}
+            );
+
+            if (r.ok) {
+                return await r.blob();
+            }
+
+            lastError = new Error(`Snapshot HTTP ${r.status}`);
+        } catch (e) {
+            lastError = e;
+        }
+
+        await sleep(250);
+    }
+
+    throw lastError || new Error('No JPEG received');
+}
+
+$('#save').addEventListener('click', async () => {
+    if (busy) return;
+
+    setBusy(true);
+    message.textContent = 'Opening camera…';
+
+    try {
+        await withCamera(async () => {
+            message.textContent = 'Saving focus and exposure…';
+            await applySettings();
+        });
+
+        message.textContent =
+            'Saved. Scheduled captures will use these settings.';
+    } catch (e) {
+        message.textContent = 'Save failed: ' + e.message;
+    } finally {
+        setBusy(false);
+    }
+});
+
+$('#test').addEventListener('click', async () => {
+    if (busy) return;
+
+    setBusy(true);
+    message.textContent = 'Opening camera…';
+
+    try {
+        const blob = await withCamera(async () => {
+            message.textContent = 'Camera settling…';
+
+            await applySettings();
+
+            // Allow AE to settle again after changing compensation.
+            await sleep(2000);
+
+            message.textContent = 'Taking 1920 × 1080 test shot…';
+            return await getFreshSnapshot();
+        });
+
+        if (previewUrl) {
+            URL.revokeObjectURL(previewUrl);
+        }
+
+        previewUrl = URL.createObjectURL(blob);
+
+        preview.src = previewUrl;
+        preview.style.display = 'block';
+        empty.style.display = 'none';
+
+        download.href = previewUrl;
+        download.hidden = false;
+
+        const stamp = new Date()
+            .toISOString()
+            .replaceAll(':','-')
+            .replace('T','_')
+            .slice(0,19);
+
+        download.download =
+            `bugcam-test-${stamp}.jpg`;
+
+        message.textContent =
+            'Test shot ready · camera returned to idle.';
+    } catch (e) {
+        message.textContent = 'Test shot failed: ' + e.message;
+    } finally {
+        setBusy(false);
+    }
+});
+
+async function loadSavedSettings(){
+    try {
+        const f = await control('/focus/get');
+        const d = Number(f.message);
+
+        if (Number.isFinite(d)) {
+            focus.value = String(d);
+        }
+    } catch (_) {}
+
+    try {
+        const e = await control('/exposure/get');
+        const steps = Number(e.message);
+
+        if (Number.isInteger(steps)) {
+            exposure.value = String(
+                Math.max(-12, Math.min(12, steps))
+            );
+        }
+    } catch (_) {}
+
+    updateLabels();
+}
+
+async function poll(){
+    try {
+        const r = await fetch('/health', {cache:'no-store'});
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+
+        const h = await r.json();
+
+        if (Number(h.min_focus_distance_diopters) > 0) {
+            focus.max =
+                String(h.min_focus_distance_diopters);
+        }
+
+        $('#summary').textContent =
+            `${String(h.camera_state).replaceAll('_',' ')} · ` +
+            `${h.resolution.width} × ${h.resolution.height} · ` +
+            `battery ${h.battery_percent ?? '?'}% / ` +
+            `${h.battery_temperature_c ?? '?'} °C · ` +
+            `thermal ${h.thermal_status_name}`;
+
+        $('#health').textContent =
+            JSON.stringify(h, null, 2);
+
+    } catch (e) {
+        $('#summary').textContent =
+            'BugCam connection unavailable.';
+    }
+
+    setTimeout(poll, 3000);
+}
+
+updateLabels();
+loadSavedSettings();
+poll();
+</script>
+</html>

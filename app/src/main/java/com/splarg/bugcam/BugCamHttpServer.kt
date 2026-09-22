@@ -129,7 +129,7 @@ class BugCamHttpServer(
         }
         when (path) {
             "/" -> respond(client, output, 200, "text/html; charset=utf-8", page, head,
-                "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'\r\n")
+                "Content-Security-Policy: default-src 'self'; img-src 'self' blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'\r\n")
             "/health" -> respond(client, output, 200, "application/json; charset=utf-8",
                 healthJson().toByteArray(StandardCharsets.UTF_8), head)
             "/snapshot.jpg" -> {
@@ -139,7 +139,7 @@ class BugCamHttpServer(
                     "X-Frame-Sequence: ${frame.sequence}\r\nX-Frame-Time-Millis: ${frame.unixMillis}\r\n")
             }
             "/stream" -> stream(client, output, head)
-            "/torch/on", "/torch/off", "/focus/lock", "/focus/auto" -> {
+            "/camera/on", "/camera/off", "/torch/on", "/torch/off", "/focus/lock", "/focus/auto", "/focus/restore", "/focus/set", "/focus/get", "/exposure/set", "/exposure/get", "/exposure/0", "/exposure/p2", "/exposure/p3", "/exposure/p4" -> {
                 val result = control(target)
                 respond(client, output, result.status, "application/json; charset=utf-8",
                     result.json.toByteArray(StandardCharsets.UTF_8), head)

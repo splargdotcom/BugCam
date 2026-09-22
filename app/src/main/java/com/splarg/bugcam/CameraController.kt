@@ -87,8 +87,14 @@ class CameraController(
         cameraHandler.post {
             if (running || closing.get()) return@post
             running = true
+
+            cameraHandler.removeCallbacks(watchdog)
+            cameraHandler.removeCallbacks(openFailsafe)
+
             openCamera()
+
             cameraHandler.postDelayed(watchdog, 2000)
+            cameraHandler.postDelayed(openFailsafe, 15_000)
         }
     }
 
@@ -101,6 +107,31 @@ class CameraController(
             }
             if (stableSince != 0L && now - stableSince > 10_000_000_000L) failures = 0
             cameraHandler.postDelayed(this, 2000)
+        }
+    }
+
+    /**
+     * Last-resort protection against a lost ThinkCentre/Wi-Fi request.
+     * The physical camera must never remain open indefinitely.
+     */
+    private val openFailsafe = object : Runnable {
+        override fun run() {
+            if (!running || closing.get()) return
+
+            Log.w(TAG, "15 second camera-open failsafe triggered")
+
+            running = false
+            retryPending = false
+
+            cameraHandler.removeCallbacks(watchdog)
+
+            closeSession()
+
+            status = status.copy(
+                state = "idle",
+                torchEnabled = false,
+                torchStrength = null
+            )
         }
     }
 
@@ -155,6 +186,10 @@ class CameraController(
                     device = camera
                     configure(camera, newReader, characteristics, token)
                 }
+                override fun onClosed(camera: CameraDevice) {
+                    Log.i(TAG, "Camera device fully closed")
+                }
+
                 override fun onDisconnected(camera: CameraDevice) {
                     camera.close()
                     if (current(token)) recover("Rear camera disconnected")
@@ -184,6 +219,17 @@ class CameraController(
                             addTarget(output.surface)
                             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+
+                            // Apply the user's persisted exposure compensation
+                            // every time the physical camera wakes.
+                            val savedExposureSteps =
+                                ExposureMemory.load(appContext)
+
+                            set(
+                                CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                                savedExposureSteps
+                            )
+
                             set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                             if (Build.VERSION.SDK_INT >= 30 &&
                                 chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.contains(1.0f) == true) {
@@ -257,10 +303,12 @@ class CameraController(
     }
 
     private fun chooseAeRange(ranges: List<Range<Int>>): Range<Int>? {
-        // Aim for 15 sensor fps. Never force an unsupported range or 30 JPEGs/sec.
+        // Keep the sensor close to the configured publish rate.
+        // Lower sensor FPS materially reduces thermals on an always-on camera.
+        val target = config.fps
         return ranges.minWithOrNull(compareBy<Range<Int>> {
-            if (it.lower <= 15 && it.upper >= 15) 0 else 1
-        }.thenBy { abs(it.upper - 15) }.thenBy { abs(it.lower - 15) })
+            if (it.lower <= target && it.upper >= target) 0 else 1
+        }.thenBy { abs(it.upper - target) }.thenBy { abs(it.lower - target) })
     }
 
     private fun onImage(source: ImageReader, token: Int) {
@@ -452,6 +500,146 @@ class CameraController(
         }
     }
 
+    fun setExposureCompensation(steps: Int, callback: (ControlResult) -> Unit = {}) {
+        cameraHandler.post {
+            val chars = activeCharacteristics
+            val builder = requestBuilder
+            val s = session
+
+            if (!running || chars == null || builder == null || s == null) {
+                callback(ControlResult(false, "Camera is not ready"))
+                return@post
+            }
+
+            val range = chars.get(
+                CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE
+            )
+
+            if (range == null) {
+                callback(ControlResult(false, "AE compensation unavailable"))
+                return@post
+            }
+
+            try {
+                val value = steps.coerceIn(range.lower, range.upper)
+
+                ExposureMemory.save(appContext, value)
+
+                builder.set(
+                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                    value
+                )
+
+                s.setRepeatingRequest(
+                    builder.build(),
+                    activeCaptureCallback,
+                    cameraHandler
+                )
+
+                callback(
+                    ControlResult(
+                        true,
+                        "AE compensation set to $value steps"
+                    )
+                )
+            } catch (e: Exception) {
+                callback(
+                    ControlResult(
+                        false,
+                        "Exposure change failed: ${e.message}"
+                    )
+                )
+            }
+        }
+    }
+
+    fun getSavedFocus(callback: (ControlResult) -> Unit = {}) {
+        cameraHandler.post {
+            val value = FocusMemory.loadLockedDistance(appContext)
+            callback(
+                ControlResult(
+                    true,
+                    value?.toString() ?: ""
+                )
+            )
+        }
+    }
+
+    fun getSavedExposure(callback: (ControlResult) -> Unit = {}) {
+        cameraHandler.post {
+            callback(
+                ControlResult(
+                    true,
+                    ExposureMemory.load(appContext).toString()
+                )
+            )
+        }
+    }
+
+    fun setManualFocus(distanceDiopters: Float, callback: (ControlResult) -> Unit = {}) {
+        cameraHandler.post {
+            val builder = requestBuilder
+            val s = session
+            val min = status.minFocusDistanceDiopters ?: 0f
+
+            if (!running || builder == null || s == null) {
+                callback(ControlResult(false, "Camera is not ready"))
+                return@post
+            }
+
+            if (min <= 0f) {
+                callback(ControlResult(false, "Manual focus is not available"))
+                return@post
+            }
+
+            try {
+                val lockedDistance = distanceDiopters.coerceIn(0f, min)
+
+                builder.set(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_OFF
+                )
+                builder.set(
+                    CaptureRequest.LENS_FOCUS_DISTANCE,
+                    lockedDistance
+                )
+
+                s.setRepeatingRequest(
+                    builder.build(),
+                    activeCaptureCallback,
+                    cameraHandler
+                )
+
+                FocusMemory.saveLocked(
+                    appContext,
+                    lockedDistance
+                )
+
+                status = status.copy(
+                    focusMode = "locked",
+                    autofocus = "locked",
+                    focusDistanceDiopters = lockedDistance
+                )
+
+                callback(
+                    ControlResult(
+                        true,
+                        "Manual focus set and saved at %.6f diopters".format(
+                            lockedDistance
+                        )
+                    )
+                )
+            } catch (e: Exception) {
+                callback(
+                    ControlResult(
+                        false,
+                        "Manual focus failed: ${e.message}"
+                    )
+                )
+            }
+        }
+    }
+
     fun lockCurrentFocus(callback: (ControlResult) -> Unit = {}) {
         cameraHandler.post {
             val builder = requestBuilder; val s = session
@@ -490,6 +678,31 @@ class CameraController(
         val delay = (1000L shl (failures - 1).coerceAtMost(5)).coerceAtMost(30_000)
         Log.w(TAG, "Retrying in ${delay}ms; size index=$sizeIndex")
         cameraHandler.postDelayed({ if (running && !closing.get()) openCamera() }, delay)
+    }
+
+    /**
+     * Close the physical camera while keeping this controller reusable.
+     * A later start() opens a fresh camera session.
+     */
+    fun pause() {
+        cameraHandler.post {
+            if (closing.get()) return@post
+            running = false
+            retryPending = false
+
+            // Cancel only BugCam-owned scheduled work.
+            // Do NOT erase Camera2 lifecycle callbacks: a late onOpened()
+            // or onConfigured() must still run so it can close stale resources.
+            cameraHandler.removeCallbacks(watchdog)
+            cameraHandler.removeCallbacks(openFailsafe)
+
+            closeSession()
+            status = status.copy(
+                state = "idle",
+                torchEnabled = false,
+                torchStrength = null
+            )
+        }
     }
 
     private fun closeSession() {

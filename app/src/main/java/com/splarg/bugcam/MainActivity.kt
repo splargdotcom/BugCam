@@ -76,7 +76,7 @@ class MainActivity : Activity() {
         fps = spinner(body, AppConfig.rates.map { "$it fps" }, AppConfig.rates.indexOf(config.fps).coerceAtLeast(0))
         text("Clockwise image rotation")
         rotation = spinner(body, AppConfig.rotations.map { "$it°" }, AppConfig.rotations.indexOf(config.rotation))
-        text("Stop before changing settings. JPEG quality: 85. The actual camera size may be smaller if the preferred size is unsupported.", 14f)
+        text("Stop before changing settings. JPEG quality: 78. The actual camera size may be smaller if the preferred size is unsupported.", 14f)
         text("Grant permissions once, start BugCam, then turn the screen off or close this screen. The notification shows when the camera service is running.", 14f)
         body.addView(Button(this).apply {
             text = "App permissions / battery settings"

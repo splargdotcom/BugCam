@@ -5,7 +5,7 @@ import android.content.Context
 data class AppConfig(
     val width: Int = 1920,
     val height: Int = 1080,
-    val fps: Int = 15,
+    val fps: Int = 10,
     val jpegQuality: Int = 85,
     val rotation: Int = 0,
     val port: Int = 8080,
@@ -27,10 +27,9 @@ data class AppConfig(
 
         fun load(context: Context): AppConfig {
             val p = prefs(context)
-            val size = (p.getInt("width", 1920) to p.getInt("height", 1080))
-                .takeIf { it in sizes } ?: sizes.first()
+            val size = 1920 to 1080
             return AppConfig(size.first, size.second,
-                p.getInt("fps", 15).coerceIn(1, 15),
+                p.getInt("fps", 10).coerceIn(1, 10),
                 p.getInt("quality", 85).coerceIn(50, 95),
                 p.getInt("rotation", 0).takeIf { it in rotations } ?: 0,
                 p.getInt("port", 8080).coerceIn(1024, 65535))
@@ -74,4 +73,24 @@ object BugCamRuntime {
     @Volatile var running = false
     @Volatile var summary = "Stopped"
     @Volatile var lastError: String? = null
+}
+
+
+/** Persisted AE exposure compensation, in Camera2 native 1/6-EV steps. */
+object ExposureMemory {
+    private const val PREFS = "bugcam"
+    private const val KEY_STEPS = "exposure_compensation_steps"
+
+    private fun prefs(context: Context) =
+        context.createDeviceProtectedStorageContext()
+            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun load(context: Context): Int =
+        prefs(context).getInt(KEY_STEPS, 0)
+
+    fun save(context: Context, steps: Int) {
+        prefs(context).edit()
+            .putInt(KEY_STEPS, steps)
+            .apply()
+    }
 }
