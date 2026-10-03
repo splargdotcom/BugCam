@@ -21,6 +21,9 @@ class WifiHttpHost(
     context: Context, private val config: AppConfig, private val frames: FrameStore,
     private val health: () -> String, private val page: ByteArray,
     private val control: (String) -> HttpControlResult = { HttpControlResult(501, "{\"error\":\"Camera control unavailable\"}") },
+    private val snapshot: (StillOptions) -> SnapshotResult = { SnapshotResult(503, message = "Still capture unavailable") },
+    private val livePage: ByteArray = "Positioning view unavailable\n".toByteArray(),
+    private val liveKeepalive: () -> Long? = { null },
 ) : AutoCloseable {
     private data class Binding(val network: Network, val address: Inet4Address)
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
@@ -91,7 +94,8 @@ class WifiHttpHost(
         }
         try {
             val next = BugCamHttpServer(desired.address, config.port, frames, health, page, control = control,
-                log = { message, error -> Log.w(TAG, message, error) })
+                log = { message, error -> Log.w(TAG, message, error) }, snapshot = snapshot,
+                livePage = livePage, liveKeepalive = liveKeepalive)
             next.start()
             server = next
             binding = desired

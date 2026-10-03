@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BugCam positioning</title>
+<style>
+*{box-sizing:border-box}
+:root{--page:#f4f7f2;--ink:#193c28;--accent:#21643d;--line:#cbd9cf;--trim:#ef5350;--crop:#3ddc84}
+body{font:16px system-ui,sans-serif;background:var(--page);color:var(--ink);max-width:1200px;margin:20px auto;padding:0 16px 32px}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+h1{margin:0;font-size:28px}
+a{color:var(--accent)}
+.viewer{position:relative;margin:14px auto 10px;background:var(--ink);border-radius:10px;overflow:hidden;
+  aspect-ratio:4/3;width:min(100%,106.67vh)}
+.stage{position:relative;width:100%;height:100%}
+.stage img,.stage svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+.stage img{object-fit:fill}
+.message{position:absolute;inset:0;display:grid;place-content:center;justify-items:center;gap:14px;padding:24px;
+  color:#e8f2eb;text-align:center;background:rgba(25,60,40,.82)}
+.message p{margin:0;max-width:46ch;line-height:1.5}
+.message[hidden]{display:none}
+.status{display:flex;flex-wrap:wrap;gap:6px 22px;font-variant-numeric:tabular-nums;min-height:1.5em}
+.status .warn{color:#b3261e;font-weight:600}
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 18px;margin:14px 0;padding:12px 14px;
+  background:white;border:1px solid var(--line);border-radius:10px}
+.toolbar label{display:inline-flex;align-items:center;gap:6px}
+.group{display:inline-flex;align-items:center;gap:8px}
+.spacer{flex:1}
+button,select,input{font:inherit;color:inherit}
+button{padding:9px 14px;border-radius:8px;border:1px solid #62816c;background:white;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:white}
+button:disabled{opacity:.5;cursor:default}
+select,input[type=number]{padding:7px 8px;border-radius:8px;border:1px solid #9db5a4;background:white}
+input[type=number]{width:4.5em}
+:focus-visible{outline:3px solid #f2b705;outline-offset:2px}
+.note{font-size:14px;line-height:1.5;color:#3d5a47;max-width:80ch}
+</style>
+
+<header>
+  <h1>Position the terrarium</h1>
+  <a href="/">Back to dashboard</a>
+</header>
+
+<div class="viewer">
+  <div class="stage">
+    <img id="frame" alt="Live positioning preview of the full camera frame">
+    <svg id="overlay" aria-hidden="true" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="message" id="message">
+    <p id="messageText">Opens the camera with a full-frame preview and marks the timelapse crop.</p>
+    <button class="primary" id="startButton">Start positioning view</button>
+  </div>
+</div>
+
+<div class="status" id="status" aria-live="polite"></div>
+
+<div class="toolbar">
+  <label>Crop
+    <select id="crop">
+      <option value="16:9">16:9</option>
+      <option value="3:2">3:2</option>
+      <option value="1:1">1:1</option>
+      <option value="full">Full frame</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="labels" checked> Labels</label>
+  <label><input type="checkbox" id="thirds"> Thirds grid</label>
+  <label><input type="checkbox" id="centre"> Centre mark</label>
+  <span class="spacer"></span>
+  <span class="group">
+    <label for="torchLevel">Torch level</label>
+    <input type="number" id="torchLevel" min="1" max="45" value="12">
+    <button id="torchButton" disabled>Turn torch on</button>
+  </span>
+  <button id="stopButton" disabled>Stop camera</button>
+</div>
+
+<p class="note">This view is only for lining up the camera and terrarium. The crop marks are drawn by your
+browser; photos, the timelapse and <code>/stream</code> are not changed. The camera closes about 15 seconds
+after this page stops updating (for example when you close the tab), and the view stops after 10 minutes
+until you resume it. If the timelapse schedule turns the camera off, press Resume.</p>
+
+<script>
+const $ = id => document.getElementById(id);
+const SVG = 'http://www.w3.org/2000/svg';
+const TRIM = '#ef5350', CROP = '#3ddc84';
+const state = {live:false, seq:0, frameW:0, frameH:0, stillW:0, stillH:0, remaining:null,
+  fpsTimes:[], objectUrl:null, torchOn:false, torchMax:45, error:''};
+
+const params = new URLSearchParams(location.search);
+if ([...$('crop').options].some(o => o.value === params.get('crop'))) $('crop').value = params.get('crop');
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function showMessage(text, buttonText) {
+  $('messageText').textContent = text;
+  $('startButton').textContent = buttonText;
+  $('message').hidden = false;
+}
+
+async function control(url) {
+  try {
+    const r = await fetch(url, {cache:'no-store'});
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || body.ok === false) throw new Error(body.error || `HTTP ${r.status}`);
+    state.error = '';
+    return body;
+  } catch (e) { state.error = `${url}: ${e.message}`; renderStatus(); return null; }
+}
+
+async function start() {
+  $('startButton').disabled = true;
+  showMessage('Opening the camera…', 'Start positioning view');
+  const ok = await control('/live/start');
+  $('startButton').disabled = false;
+  if (!ok) { showMessage('The camera could not start. ' + state.error, 'Try again'); return; }
+  state.live = true;
+  $('stopButton').disabled = false;
+  refreshHealth();
+  loop();
+}
+
+async function stop() {
+  state.live = false;
+  await control('/live/stop');
+  $('stopButton').disabled = true;
+  showMessage('Positioning view stopped. The camera and torch are off.', 'Start positioning view');
+  renderStatus();
+  refreshHealth();
+}
+
+function ended(reason) {
+  state.live = false;
+  $('stopButton').disabled = true;
+  showMessage(reason === 'expired'
+    ? 'The 10-minute limit was reached. Resume to keep positioning.'
+    : 'The camera was switched off, possibly by the timelapse schedule or another client.', 'Resume');
+  renderStatus();
+  refreshHealth();
+}
+
+async function loop() {
+  while (state.live && !document.hidden) {
+    let r;
+    try { r = await fetch(`/live.jpg?after=${state.seq}`, {cache:'no-store'}); }
+    catch { state.error = 'Lost contact with the phone; retrying'; renderStatus(); await sleep(1000); continue; }
+    if (!state.live) return; // Stopped while this request was in flight.
+    if (r.status === 409) { ended(r.headers.get('X-Positioning')); return; }
+    if (!r.ok) { await sleep(500); continue; }
+    state.seq = Number(r.headers.get('X-Frame-Sequence')) || state.seq;
+    state.remaining = Number(r.headers.get('X-Positioning-Remaining-Seconds'));
+    const w = Number(r.headers.get('X-Frame-Width')), h = Number(r.headers.get('X-Frame-Height'));
+    const blob = await r.blob();
+    if (!state.live) return;
+    const url = URL.createObjectURL(blob);
+    $('frame').src = url;
+    if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
+    state.objectUrl = url;
+    $('message').hidden = true;
+    state.error = '';
+    const now = performance.now();
+    state.fpsTimes = state.fpsTimes.filter(t => now - t < 3000).concat(now);
+    if (w !== state.frameW || h !== state.frameH) {
+      state.frameW = w; state.frameH = h;
+      const v = document.querySelector('.viewer');
+      v.style.aspectRatio = `${w} / ${h}`;
+      v.style.width = `min(100%, ${(80 * w / h).toFixed(2)}vh)`;
+      drawOverlay();
+    }
+    renderStatus();
+  }
+}
+
+document.addEventListener('visibilitychange', () => { if (!document.hidden && state.live) loop(); });
+
+async function refreshHealth() {
+  try {
+    const h = await (await fetch('/health', {cache:'no-store'})).json();
+    const s = h.still_resolution || {};
+    if (s.width > 0 && (s.width !== state.stillW || s.height !== state.stillH)) {
+      state.stillW = s.width; state.stillH = s.height; drawOverlay();
+    }
+    state.torchOn = !!h.torch_enabled;
+    state.torchMax = h.torch_max_strength || 45;
+    $('torchLevel').max = state.torchMax;
+    $('torchButton').disabled = !state.live || h.torch_capability !== 'available';
+    $('torchButton').textContent = state.torchOn ? 'Turn torch off' : 'Turn torch on';
+    if (state.live && h.positioning === false && h.camera_state === 'idle') ended('inactive');
+  } catch {}
+}
+
+async function pollHealth() { await refreshHealth(); setTimeout(pollHealth, 2000); }
+
+function orientedStill() {
+  let W = state.stillW, H = state.stillH;
+  if (W && state.frameW && (state.frameW > state.frameH) !== (W > H)) [W, H] = [H, W];
+  return [W, H];
+}
+
+function fullFrameMismatch() {
+  const [W, H] = orientedStill();
+  return !(W && state.frameW) ? false : Math.abs(state.frameW / state.frameH - W / H) > 0.02;
+}
+
+function el(name, attrs, parent) {
+  const e = document.createElementNS(SVG, name);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  parent.appendChild(e);
+  return e;
+}
+
+function pill(parent, x, y, lines, colour, border, size, anchor, frameW) {
+  const g = el('g', {}, parent);
+  const text = el('text', {x, y, fill: colour, 'font-size': size, 'font-weight': 700,
+    'font-family': 'system-ui,sans-serif', 'text-anchor': 'middle', 'dominant-baseline': 'central'}, g);
+  lines.forEach((line, i) => {
+    const t = el('tspan', {x, dy: i === 0 ? -(lines.length - 1) * size * 0.6 : size * 1.2}, text);
+    t.textContent = line;
+  });
+  const b = text.getBBox(), pad = size * 0.45;
+  let dx = anchor === 'end' ? -b.width / 2 - pad : 0;
+  const lo = b.x - pad + dx, hi = b.x + b.width + pad + dx, margin = size * 0.3; // Stay inside the frame.
+  if (lo < margin) dx += margin - lo; else if (hi > frameW - margin) dx -= hi - (frameW - margin);
+  text.setAttribute('transform', `translate(${dx} 0)`);
+  el('rect', {x: b.x - pad + dx, y: b.y - pad * 0.7, width: b.width + pad * 2, height: b.height + pad * 1.4,
+    rx: size * 0.3, fill: 'rgba(10,20,14,.82)', stroke: border, 'stroke-width': size * 0.08}, g);
+  g.appendChild(text);
+  return g;
+}
+
+function arrow(parent, x1, y1, x2, y2, size) {
+  el('line', {x1, y1, x2, y2, stroke: TRIM, 'stroke-width': size * 0.09}, parent);
+  const head = (x, y, ux, uy) => el('path', {fill: TRIM, d:
+    `M${x} ${y} L${x - ux * size * .5 - uy * size * .3} ${y - uy * size * .5 + ux * size * .3} ` +
+    `L${x - ux * size * .5 + uy * size * .3} ${y - uy * size * .5 - ux * size * .3} Z`}, parent);
+  const len = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+  head(x2, y2, ux, uy); head(x1, y1, -ux, -uy);
+}
+
+function drawOverlay() {
+  const svg = $('overlay');
+  svg.replaceChildren();
+  const [W, H] = orientedStill();
+  if (!W || !state.frameW || fullFrameMismatch()) { renderStatus(); return; }
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  // Keep text readable on small screens: at least ~13 CSS px whatever the displayed width.
+  const shown = svg.getBoundingClientRect().width || 800;
+  const size = Math.max(W * 0.024, 13 * W / shown);
+  const choice = $('crop').value;
+  let cw = W, ch = H;
+  if (choice !== 'full') {
+    const [aw, ah] = choice.split(':').map(Number);
+    if (W / H > aw / ah) cw = Math.round(H * aw / ah); else ch = Math.round(W * ah / aw);
+  }
+  const left = Math.floor((W - cw) / 2), top = Math.floor((H - ch) / 2);
+  const right = W - cw - left, bottom = H - ch - top;
+  const labels = $('labels').checked;
+  const trims = [];
+  if (top > 0) trims.push({r: [0, 0, W, top], a: [W / 2, 0, W / 2, top], n: top},
+    {r: [0, H - bottom, W, bottom], a: [W / 2, H - bottom, W / 2, H], n: bottom});
+  if (left > 0) trims.push({r: [0, 0, left, H], a: [0, H / 2, left, H / 2], n: left},
+    {r: [W - right, 0, right, H], a: [W - right, H / 2, W, H / 2], n: right});
+  for (const t of trims) {
+    el('rect', {x: t.r[0], y: t.r[1], width: t.r[2], height: t.r[3], fill: 'rgba(239,83,80,.34)'}, svg);
+  }
+  el('rect', {x: size * .06, y: size * .06, width: W - size * .12, height: H - size * .12, fill: 'none',
+    stroke: TRIM, 'stroke-width': size * .12}, svg);
+  el('rect', {x: left, y: top, width: cw, height: ch, fill: 'none', stroke: CROP,
+    'stroke-width': size * .16}, svg);
+  if ($('thirds').checked) for (const f of [1 / 3, 2 / 3]) {
+    el('line', {x1: left + cw * f, y1: top, x2: left + cw * f, y2: top + ch, stroke: 'rgba(255,255,255,.55)', 'stroke-width': size * .06}, svg);
+    el('line', {x1: left, y1: top + ch * f, x2: left + cw, y2: top + ch * f, stroke: 'rgba(255,255,255,.55)', 'stroke-width': size * .06}, svg);
+  }
+  if ($('centre').checked) {
+    const cx = left + cw / 2, cy = top + ch / 2, r = size * 1.2;
+    el('path', {d: `M${cx - r} ${cy} H${cx + r} M${cx} ${cy - r} V${cy + r}`, stroke: CROP, 'stroke-width': size * .1}, svg);
+  }
+  if (!labels) return;
+  const frameLabel = pill(svg, W - size * .8, size * 1.9, ['Full camera frame:', `${W}×${H}`], 'white', 'white', size, 'end', W);
+  const f = frameLabel.getBBox();
+  for (const t of trims) {
+    const g = el('g', {}, svg);
+    const across = t.a[0] === t.a[2]; // Top/bottom band: vertical arrow, one-line label.
+    arrow(g, ...t.a, size);
+    pill(g, (t.a[0] + t.a[2]) / 2, (t.a[1] + t.a[3]) / 2,
+      across ? [`${t.n} px trimmed`] : [`${t.n} px`, 'trimmed'], '#ffd9d8', TRIM, size, undefined, W);
+    const b = g.getBBox();
+    const overlaps = b.x < f.x + f.width && f.x < b.x + b.width && b.y < f.y + f.height && f.y < b.y + b.height;
+    if (across && overlaps) g.setAttribute('transform', `translate(${W * 0.27 - W / 2} 0)`);
+  }
+  const name = choice === 'full' ? 'full frame' : choice;
+  pill(svg, left + cw / 2, top + ch / 2, ['Timelapse crop:', `${cw}×${ch} (${name})`], CROP, CROP, size * 1.15, undefined, W);
+  svg.appendChild(frameLabel); // Keep the frame label on top.
+}
+
+function renderStatus() {
+  const s = $('status');
+  s.replaceChildren();
+  const add = (text, cls) => { const e = document.createElement('span'); e.textContent = text; if (cls) e.className = cls; s.appendChild(e); };
+  if (state.live) {
+    add('Live');
+    const t = state.fpsTimes;
+    add(`${t.length > 1 ? ((t.length - 1) * 1000 / (t[t.length - 1] - t[0])).toFixed(1) : '0.0'} fps`);
+    if (state.frameW) add(`Preview ${state.frameW}×${state.frameH}`);
+    if (Number.isFinite(state.remaining)) add(`${Math.floor(state.remaining / 60)} min ${state.remaining % 60} s left`);
+  } else add('Camera off');
+  if (fullFrameMismatch()) add(`This preview is ${state.frameW}×${state.frameH}, not the full frame, so the crop marks are hidden.`, 'warn');
+  if (state.error) add(state.error, 'warn');
+}
+
+$('startButton').onclick = start;
+$('stopButton').onclick = stop;
+$('torchButton').onclick = async () => {
+  const level = Math.min(state.torchMax, Math.max(1, Number($('torchLevel').value) || 12));
+  $('torchLevel').value = level;
+  await control(state.torchOn ? '/torch/off' : `/torch/on?level=${level}`);
+  refreshHealth();
+};
+for (const id of ['crop', 'labels', 'thirds', 'centre']) $(id).onchange = () => {
+  if (id === 'crop') { params.set('crop', $('crop').value); history.replaceState(null, '', `?${params}`); }
+  drawOverlay();
+};
+addEventListener('resize', drawOverlay);
+renderStatus();
+pollHealth();
+</script>
+</html>

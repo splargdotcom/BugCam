@@ -20,6 +20,82 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class HttpControlResult(val status: Int, val json: String)
+/** [headers]: extra CRLF-terminated response headers for a successful still (e.g. X-Still-*). */
+data class SnapshotResult(val status: Int, val frame: JpegFrame? = null, val message: String = "",
+    val headers: String = "")
+
+/**
+ * Manual still exposure: `/snapshot.jpg?exposure_ns=<ns>&iso=<iso>`, for that one still only.
+ * Without either parameter the still is the unchanged automatic one; one without the other is
+ * rejected (HTTP 400), as are other keys beginning "exposure"/"iso", so a mistyped name cannot
+ * silently give an automatic photo. Other query keys (e.g. cache busters) are ignored.
+ * CameraController clamps both values to physical camera 3's advertised ranges.
+ */
+data class ManualExposure(val exposureNs: Long, val iso: Int) {
+    /** Extra still/HTTP wait: long manual frames slow the whole preview pipeline, not just the JPEG. */
+    fun extraWaitMillis(): Long =
+        EXTRA_WAIT_FRAMES * maxOf(minOf(exposureNs, MAX_EXPOSURE_NS) / 1_000_000L, MIN_FRAME_BUDGET_MILLIS)
+
+    companion object {
+        const val EXPOSURE_PARAM = "exposure_ns"
+        const val ISO_PARAM = "iso"
+        /** BugCam's own ceiling (keeps the still inside its timeouts); applied on top of camera 3's range. */
+        const val MAX_EXPOSURE_NS = 1_000_000_000L
+        private const val EXTRA_WAIT_FRAMES = 10L // Pipeline depth + settle frames + JPEG behind in-flight frames.
+        private const val MIN_FRAME_BUDGET_MILLIS = 100L
+
+        /** null = automatic exposure; IllegalArgumentException = malformed/partial request (HTTP 400). */
+        fun fromQuery(target: String): ManualExposure? {
+            val params = queryPairs(target)
+            params.map { it.first }.firstOrNull { key ->
+                key !in listOf(EXPOSURE_PARAM, ISO_PARAM) &&
+                    (key.startsWith("exposure", ignoreCase = true) || key.startsWith("iso", ignoreCase = true))
+            }?.let { throw IllegalArgumentException("Unknown exposure parameter '$it'; use $EXPOSURE_PARAM and $ISO_PARAM") }
+            val rawNs = params.lastOrNull { it.first == EXPOSURE_PARAM }?.second
+            val rawIso = params.lastOrNull { it.first == ISO_PARAM }?.second
+            if (rawNs == null && rawIso == null) return null
+            val ns = rawNs?.toLongOrNull()
+            val iso = rawIso?.toIntOrNull()
+            require(ns != null && iso != null && ns > 0 && iso > 0) {
+                "Manual exposure needs both $EXPOSURE_PARAM=<positive integer nanoseconds> " +
+                    "and $ISO_PARAM=<positive integer>"
+            }
+            return ManualExposure(ns, iso)
+        }
+    }
+}
+
+/**
+ * Optional per-still settings parsed from `/snapshot.jpg?...`. Defaults = the unchanged automatic still.
+ * [focusDiopters]: `focus_diopters=N` (0 = infinity) for this still only: AF off and a fixed lens
+ * distance on the preview and the JPEG request. Clamping to the lens range happens in CameraController.
+ * Any other key beginning "focus" is rejected, so a mistyped name cannot silently autofocus.
+ */
+data class StillOptions(val exposure: ManualExposure? = null, val focusDiopters: Float? = null) {
+    companion object {
+        const val FOCUS_PARAM = "focus_diopters"
+
+        /** IllegalArgumentException = malformed request (HTTP 400). */
+        fun fromQuery(target: String): StillOptions {
+            val exposure = ManualExposure.fromQuery(target)
+            val params = queryPairs(target)
+            params.map { it.first }.firstOrNull { it != FOCUS_PARAM && it.startsWith("focus", ignoreCase = true) }
+                ?.let { throw IllegalArgumentException("Unknown focus parameter '$it'; use $FOCUS_PARAM") }
+            val focus = params.lastOrNull { it.first == FOCUS_PARAM }?.second?.let { raw ->
+                raw.toFloatOrNull()?.takeIf { it.isFinite() }
+                    ?: throw IllegalArgumentException("$FOCUS_PARAM must be a finite number of diopters (0 = infinity)")
+            }
+            return StillOptions(exposure, focus)
+        }
+    }
+}
+
+/** How long /live.jpg waits for a frame newer than `after` before returning the latest one. */
+private const val LIVE_FRAME_WAIT_MILLIS = 2_000L
+
+private fun queryPairs(target: String): List<Pair<String, String>> =
+    target.substringAfter('?', "").split('&').filter { it.isNotEmpty() }
+        .map { it.substringBefore('=') to it.substringAfter('=', "") }
 
 /** Small HTTP server with bounded resources. No Android classes: loopback-testable on the JVM. */
 class BugCamHttpServer(
@@ -32,6 +108,12 @@ class BugCamHttpServer(
     private val log: (String, Throwable?) -> Unit = { _, _ -> },
     private val writeTimeoutMillis: Long = 10_000,
     private val headerTimeoutMillis: Long = 5_000,
+    private val snapshot: (StillOptions) -> SnapshotResult = { SnapshotResult(503, message = "Still capture unavailable") },
+    private val snapshotTimeoutMillis: Long = 16_000,
+    /** Positioning page (/live): browser-side crop overlay over /live.jpg; never drawn into frames. */
+    private val livePage: ByteArray = "Positioning view unavailable\n".toByteArray(),
+    /** Keeps the positioning camera open: null = not active, <= 0 = time limit reached, else ms left. */
+    private val liveKeepalive: () -> Long? = { null },
 ) : AutoCloseable {
     private data class Client(val socket: Socket, @Volatile var deadlineNanos: Long)
     private val clients = ConcurrentHashMap<Socket, Client>()
@@ -133,13 +215,29 @@ class BugCamHttpServer(
             "/health" -> respond(client, output, 200, "application/json; charset=utf-8",
                 healthJson().toByteArray(StandardCharsets.UTF_8), head)
             "/snapshot.jpg" -> {
-                val frame = freshFrame()
-                if (frame == null) unavailable(client, output, head)
+                val options = try { StillOptions.fromQuery(target) } catch (e: IllegalArgumentException) {
+                    respond(client, output, 400, "text/plain; charset=utf-8",
+                        "${e.message}\n".toByteArray(StandardCharsets.UTF_8), head)
+                    return
+                }
+                // Capture has its own bounded wait; do not reuse the short header/write deadline.
+                // Manual exposures extend it by the same budget CameraController adds to its own wait.
+                client.deadlineNanos = deadline(snapshotTimeoutMillis + (options.exposure?.extraWaitMillis() ?: 0L))
+                val result = snapshot(options)
+                val frame = result.frame
+                if (result.status != 200 || frame == null)
+                    respond(client, output, result.status.takeIf { it != 200 } ?: 503,
+                        "text/plain; charset=utf-8", (result.message + "\n").toByteArray(StandardCharsets.UTF_8), head,
+                        "Retry-After: 2\r\n")
                 else respond(client, output, 200, "image/jpeg", frame.bytes, head,
-                    "X-Frame-Sequence: ${frame.sequence}\r\nX-Frame-Time-Millis: ${frame.unixMillis}\r\n")
+                    "X-Frame-Sequence: ${frame.sequence}\r\nX-Frame-Time-Millis: ${frame.unixMillis}\r\n" +
+                        "X-Image-Width: ${frame.width}\r\nX-Image-Height: ${frame.height}\r\n" + result.headers)
             }
             "/stream" -> stream(client, output, head)
-            "/camera/on", "/camera/off", "/torch/on", "/torch/off", "/focus/lock", "/focus/auto", "/focus/restore", "/focus/set", "/focus/get", "/exposure/set", "/exposure/get", "/exposure/0", "/exposure/p2", "/exposure/p3", "/exposure/p4" -> {
+            "/live" -> respond(client, output, 200, "text/html; charset=utf-8", livePage, head,
+                "Content-Security-Policy: default-src 'self'; img-src 'self' blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'\r\n")
+            "/live.jpg" -> livePreview(client, output, target, head)
+            "/live/start", "/live/stop", "/camera/on", "/camera/off", "/torch/on", "/torch/off", "/focus/lock", "/focus/auto", "/focus/restore", "/focus/set", "/focus/get", "/exposure/set", "/exposure/get", "/exposure/0", "/exposure/p2", "/exposure/p3", "/exposure/p4" -> {
                 val result = control(target)
                 respond(client, output, result.status, "application/json; charset=utf-8",
                     result.json.toByteArray(StandardCharsets.UTF_8), head)
@@ -178,6 +276,35 @@ class BugCamHttpServer(
     }
 
     private fun freshFrame() = frames.snapshot()?.takeIf { frames.isFresh(it) }
+
+    /**
+     * One positioning frame per request (`?after=<last X-Frame-Sequence>` waits briefly for a newer one).
+     * Each request extends the camera-open failsafe, so closing the page lets the camera shut itself.
+     */
+    private fun livePreview(client: Client, output: BufferedOutputStream, target: String, head: Boolean) {
+        val remaining = liveKeepalive()
+        if (remaining == null || remaining <= 0) {
+            val state = if (remaining == null) "inactive" else "expired"
+            respond(client, output, 409, "text/plain; charset=utf-8",
+                (if (remaining == null) "Positioning view is not active; start it from /live\n"
+                else "Positioning time limit reached; press Resume on /live\n").toByteArray(StandardCharsets.UTF_8),
+                head, "X-Positioning: $state\r\n")
+            return
+        }
+        val after = queryPairs(target).lastOrNull { it.first == "after" }?.second?.toLongOrNull() ?: 0L
+        client.deadlineNanos = deadline(LIVE_FRAME_WAIT_MILLIS + writeTimeoutMillis)
+        val frame = (frames.awaitAfter(after, LIVE_FRAME_WAIT_MILLIS) ?: frames.snapshot())?.takeIf { frames.isFresh(it) }
+        if (frame == null) {
+            respond(client, output, 503, "text/plain; charset=utf-8", "No positioning frame yet\n".toByteArray(),
+                head, "Retry-After: 1\r\nX-Positioning: active\r\n")
+            return
+        }
+        client.deadlineNanos = deadline(writeTimeoutMillis)
+        respond(client, output, 200, "image/jpeg", frame.bytes, head,
+            "X-Positioning: active\r\nX-Positioning-Remaining-Seconds: ${remaining / 1000}\r\n" +
+                "X-Frame-Sequence: ${frame.sequence}\r\nX-Frame-Width: ${frame.width}\r\n" +
+                "X-Frame-Height: ${frame.height}\r\n")
+    }
 
     private fun unavailable(client: Client, output: BufferedOutputStream, head: Boolean) =
         respond(client, output, 503, "application/json", "{\"error\":\"No fresh camera frame\"}".toByteArray(), head,

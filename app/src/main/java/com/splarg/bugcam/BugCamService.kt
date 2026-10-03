@@ -87,7 +87,9 @@ class BugCamService : Service() {
             receiverRegistered = true
             camera = CameraController(this, config, frames)
             http = WifiHttpHost(this, config, frames, ::healthJson,
-                assets.open("status.html").use { it.readBytes() }, ::handleControl).also { it.start() }
+                assets.open("status.html").use { it.readBytes() }, ::handleControl,
+                ::captureSnapshot, assets.open("live.html").use { it.readBytes() },
+                { camera?.positioningKeepalive() }).also { it.start() }
             handler.post(tick)
             Log.i(TAG, "Started; target ${config.width}x${config.height} @ ${config.fps} JPEG fps. No wake lock.")
         } catch (e: Exception) {
@@ -150,6 +152,12 @@ class BugCamService : Service() {
             put("resolution", JSONObject().put("width", f.frame?.width ?: c.width)
                 .put("height", f.frame?.height ?: c.height))
             put("capture_resolution", JSONObject().put("width", c.width).put("height", c.height))
+            put("physical_camera_id", c.physicalCameraId ?: JSONObject.NULL)
+            put("still_resolution", JSONObject().put("width", c.stillWidth).put("height", c.stillHeight))
+            put("still_jpeg_quality", CameraController.STILL_JPEG_QUALITY)
+            put("still_pipeline", "camera2_hal_jpeg_v1")
+            put("snapshot_busy", c.snapshotBusy)
+            put("snapshot_last_error", c.lastStillError ?: JSONObject.NULL)
             put("requested_resolution", JSONObject().put("width", config.width).put("height", config.height))
             put("rotation_degrees", config.rotation); put("sensor_orientation_degrees", c.sensorOrientation)
             put("jpeg_quality", config.jpegQuality); put("sensor_ae_fps_range", c.aeRange ?: JSONObject.NULL)
@@ -166,6 +174,13 @@ class BugCamService : Service() {
             put("torch_max_strength", c.torchMaxStrength)
             put("torch_default_strength", c.torchDefaultStrength)
             put("torch_strength", c.torchStrength ?: JSONObject.NULL)
+            put("torch_requested_strength", c.torchStrength ?: JSONObject.NULL)
+            put("torch_lit", c.torchLit)
+            put("torch_current_strength", c.torchCurrentStrength ?: JSONObject.NULL)
+            put("torch_flash_state", c.torchFlashState ?: JSONObject.NULL)
+            put("positioning", c.positioning)
+            put("positioning_remaining_seconds",
+                camera?.positioningRemainingMillis()?.let { maxOf(0L, it / 1000) } ?: JSONObject.NULL)
             put("focus_mode", c.focusMode)
             put("focus_distance_diopters", c.focusDistanceDiopters ?: JSONObject.NULL)
             put("min_focus_distance_diopters", c.minFocusDistanceDiopters ?: JSONObject.NULL)
@@ -173,6 +188,11 @@ class BugCamService : Service() {
         }.toString()
     }
 
+
+    /** Default [options] = the unchanged automatic still (AF, auto exposure). */
+    private fun captureSnapshot(options: StillOptions): SnapshotResult =
+        camera?.captureStill(options.exposure, options.focusDiopters)
+            ?: SnapshotResult(503, message = "Camera unavailable")
 
     private fun handleControl(target: String): HttpControlResult {
         val cam = camera ?: return HttpControlResult(503, "{\"ok\":false,\"error\":\"Camera unavailable\"}")
@@ -186,6 +206,11 @@ class BugCamService : Service() {
                 200,
                 "{\"ok\":true,\"message\":\"Camera starting\"}"
             )
+        }
+
+        if (path == "/live/stop") {
+            cam.pause() // Same as /camera/off: the positioning camera and torch close.
+            return HttpControlResult(200, "{\"ok\":true,\"message\":\"Positioning view stopped; camera idle\"}")
         }
 
         if (path == "/camera/off") {
@@ -255,11 +280,12 @@ class BugCamService : Service() {
         }
 
         when (path) {
+            "/live/start" -> cam.startPositioning(callback)
             "/torch/on" -> cam.setTorchEnabled(true, torchLevel, callback)
             "/torch/off" -> cam.setTorchEnabled(false, null, callback)
             "/focus/lock" -> cam.lockCurrentFocus(callback)
             "/focus/auto" -> cam.setContinuousFocus(callback)
-            "/focus/restore" -> cam.setManualFocus(7.7071376f, callback)
+            "/focus/restore" -> cam.restoreSavedFocus(callback)
             "/focus/set" -> cam.setManualFocus(focusDiopters!!, callback)
             "/focus/get" -> cam.getSavedFocus(callback)
 
